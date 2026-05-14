@@ -1,0 +1,31 @@
+{
+    "mode": "dual",
+    "channels": {
+        "1": {
+            "serial": {
+                "port": "COM11",
+                "baudrate": 9600
+            },
+            "alarm": {
+                "enabled": true,
+                "low_limit": 0,
+                "high_limit": 50
+            }
+        },
+        "2": {
+            "serial": {
+                "port": "COM10",
+                "baudrate": 9600
+            },
+            "alarm": {
+                "enabled": true,
+                "low_limit": 0,
+                "high_limit": 50
+            }
+        }
+    },
+    "acquisition": {
+        "max_records": 10000,
+        "display_seconds": 300
+    }
+}
