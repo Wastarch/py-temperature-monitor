@@ -49,7 +49,7 @@ from PySide6.QtWidgets import (
 
 from core.alarm import AlarmManager
 from core.data_manager import DataManager
-from widget.serial_worker import SerialWorker, list_available_ports
+from core.serial_worker import SerialWorker, list_available_ports
 
 # 配置文件路径
 CONFIG_FILE = os.path.join(os.path.dirname(os.path.dirname(__file__)), "config.json")
@@ -78,7 +78,7 @@ class MainWindow(QMainWindow):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle("温度采集系统")
-        self.resize(1200, 700)
+        self.resize(1600, 800)
 
         # 加载配置
         self.config = self._load_config()
@@ -110,6 +110,9 @@ class MainWindow(QMainWindow):
 
         # 温度表格
         self._temp_table: QTableWidget = None
+
+        # 定时刷新曲线（先初始化为 None，_apply_config 中 _on_interval_changed 需要检查）
+        self._update_timer: QTimer | None = None
 
         # 初始化 UI
         self._setup_ui()
@@ -737,7 +740,8 @@ class MainWindow(QMainWindow):
         timestamp = datetime.now().strftime("%H:%M:%S.%f")[:-3]
         channel_count = len(result)
         channel_info = " ".join([f"CH{ch}：{temp:.1f}°C" for ch, temp in result])
-        log_msg = f"[{timestamp}] {channel_count}通道 {channel_info} -> {hex_str}"
+        # log_msg = f"[{timestamp}] {channel_count}通道 {channel_info} -> {hex_str}"
+        log_msg = f"[{timestamp}] {channel_count}通道 {channel_info}"
         self._log_text.appendPlainText(log_msg)
         self._log_text.verticalScrollBar().setValue(self._log_text.verticalScrollBar().maximum())
 
@@ -852,8 +856,7 @@ class MainWindow(QMainWindow):
     # ==================== 采集设置 ====================
 
     def _on_interval_changed(self, value: int):
-        """采集间隔变化"""
-        if self._update_timer.isActive():
+        if self._update_timer is not None and self._update_timer.isActive():
             self._update_timer.start(value)
 
     def _on_display_duration_changed(self, text: str):
