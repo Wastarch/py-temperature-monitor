@@ -4,10 +4,10 @@
 
 ## 功能特性
 
-- ✅ 单路/双路温度采集模式切换
+- ✅ 1-8路温度采集模式切换
 - ✅ 串口自动扫描（支持物理串口和虚拟串口）
-- ✅ 实时温度大字体显示
-- ✅ pyqtgraph 实时曲线图（独立子图）
+- ✅ 实时温度表格显示（固定列宽）
+- ✅ pyqtgraph 实时曲线图（合并窗口/独立窗口模式）
 - ✅ 温度超限报警（可配置上下限）
 - ✅ 数据导出（CSV/Excel 格式）
 - ✅ 配置持久化（JSON 格式）
@@ -79,13 +79,15 @@ python main.py
 ```json
 {
     "mode": "single",
+    "serial": {
+        "port": "COM11",
+        "baudrate": 9600
+    },
     "channels": {
         "1": {
-            "serial": {"port": "COM11", "baudrate": 9600},
             "alarm": {"enabled": true, "low_limit": 0, "high_limit": 50}
         },
         "2": {
-            "serial": {"port": "COM10", "baudrate": 9600},
             "alarm": {"enabled": true, "low_limit": 0, "high_limit": 50}
         }
     },
@@ -96,9 +98,10 @@ python main.py
 ### 配置参数说明
 
 - **mode**: 采集模式（single/dual）
+- **serial**: 串口配置（单路/双路共用）
+  - **port**: 串口号
+  - **baudrate**: 波特率
 - **channels**: 通道配置
-  - **serial.port**: 串口号
-  - **serial.baudrate**: 波特率
   - **alarm.enabled**: 是否启用报警
   - **alarm.low_limit**: 温度下限（°C）
   - **alarm.high_limit**: 温度上限（°C）
@@ -110,7 +113,7 @@ python main.py
 ### 串口配置
 
 1. 选择采集模式（单路/双路）
-2. 配置串口号和波特率
+2. 配置串口号和波特率（单路/双路共用一个串口）
 3. 点击"扫描串口"自动检测可用串口
 
 ### 数据采集
@@ -118,6 +121,11 @@ python main.py
 1. 点击"开始采集"启动数据采集
 2. 实时温度显示在界面上
 3. 温度曲线实时更新
+
+### 模式说明
+
+- **单路模式**：接收 CH1（0x01）通道的温度数据
+- **双路模式**：同时接收 CH1（0x01）和 CH2（0x02）通道的温度数据（共用一个串口）
 
 ### 报警设置
 
@@ -133,26 +141,57 @@ python main.py
 
 ## 数据格式
 
-### 串口数据格式
+### 二进制帧格式（可变长度）
 
-下位机发送数据格式：
-```
-TEMP:25.5\r\n
-```
-
-**格式要求**：
-- 必须以 `TEMP:` 开头（大写）
-- 温度值支持负数和小数
-- 以 `\r\n` 结尾
-- 每行一条数据
-
-### 示例数据
+下位机通过串口发送可变长度二进制数据帧：
 
 ```
-TEMP:25.5
-TEMP:-3.14
-TEMP:100.0
-TEMP:0.0
+┌──────┬────┬─────────────────────────┬──────┬──────┐
+│ 0xAA │ N  │ CH1 DATA ... CHn DATA   │ XOR  │ 0x0A │
+│ 起始  │ 通道数 │ N组通道数据(每组3字节) │ 校验 │ 结束 │
+└──────┴────┴─────────────────────────┴──────┴──────┘
+  Byte0  Byte1  Byte2 ~ Byte(N×3+1)   Byte(N×3+2)  Byte(N×3+3)
+```
+
+帧总长度 = N × 3 + 4 字节
+
+**字段说明**：
+
+| 字段 | 字节位置 | 值范围 | 说明 |
+|------|---------|--------|------|
+| 起始位 | Byte 0 | 0xAA | 固定值 |
+| 通道数 N | Byte 1 | 0x01~0x08 | 本帧包含的通道数量 |
+| CH | Byte (2 + 3i) | 0x01~0x08 | 通道号 |
+| Data_H | Byte (3 + 3i) | 0x00~0xFF | 温度高字节 |
+| Data_L | Byte (4 + 3i) | 0x00~0xFF | 温度低字节 |
+| XOR | Byte (N×3+2) | 0x00~0xFF | 校验字节 |
+| 结束位 | Byte (N×3+3) | 0x0A | 固定值 |
+
+其中 i = 0, 1, ..., N-1
+
+**校验计算**：
+
+```
+XOR = N ^ CH1 ^ Data_H1 ^ Data_L1 ^ CH2 ^ Data_H2 ^ Data_L2 ^ ... ^ CHn ^ Data_Hn ^ Data_Ln
+```
+
+校验范围：通道数字段 + 所有通道数据字段的逐字节异或
+
+**温度编码**：16 位有符号整数（Big-Endian），分辨率 0.1°C
+
+| 温度值 | 编码值 | Data_H | Data_L |
+|--------|--------|--------|--------|
+| 25.5°C | 255 | 0x00 | 0xFF |
+| -3.1°C | -31 | 0xFF | 0xE1 |
+| 100.0°C | 1000 | 0x03 | 0xE8 |
+| 0.0°C | 0 | 0x00 | 0x00 |
+
+**示例帧**：
+
+```
+单通道 (CH1 25.5°C):     AA 01 01 00 FF FF 0A
+双通道 (CH1 -3.1°C, CH2 26.3°C): AA 02 01 FF E1 02 01 07 19 0A
+三通道 (CH1 30.1°C, CH2 47.0°C, CH3 25.5°C): AA 03 01 01 2D 02 01 D6 03 00 FF 07 0A
 ```
 
 ## 开发文档
@@ -195,8 +234,8 @@ data_mgr.export_excel("data.xlsx", channels=[1])
 #### SerialWorker（串口工作线程）
 
 ```python
-# 创建串口工作线程
-worker = SerialWorker(channel_id=1, port="COM11", baudrate=9600)
+# 创建串口工作线程（单串口，支持多通道）
+worker = SerialWorker(port="COM11", baudrate=9600)
 
 # 连接信号
 worker.temperature_received.connect(on_temperature)
@@ -213,10 +252,10 @@ worker.stop()
 
 ### 信号说明
 
-- **temperature_received(channel_id, temp)**: 温度数据信号
-- **raw_data_received(channel_id, data)**: 原始数据信号
-- **connection_changed(channel_id, connected)**: 连接状态变化信号
-- **error_occurred(channel_id, error_msg)**: 错误信号
+- **temperature_received(channel_id, temp)**: 温度数据信号（channel_id: 1 或 2）
+- **raw_data_received(channel_id, data)**: 原始数据信号（data: 十六进制字符串）
+- **connection_changed(connected)**: 连接状态变化信号
+- **error_occurred(error_msg)**: 错误信号
 
 ## 故障排除
 
@@ -249,6 +288,28 @@ worker.stop()
 3. 检查 config.json 配置文件
 
 ## 版本历史
+
+### v0.4.0 (2026-05-14)
+- ✨ 数据帧格式改为可变长度（支持单帧多通道数据）
+- ✨ 原始数据日志显示优化（显示通道数、各通道温度、原始数据）
+- ✨ 错误日志添加红色背景样式
+- ✨ 添加采集间隔配置（100ms ~ 10s）
+
+### v0.3.0 (2026-05-14)
+- ✨ 支持 1-8 路温度采集模式切换
+- ✨ 温度显示改为表格形式（固定列宽 80px）
+- ✨ 曲线显示支持两种模式：合并窗口/独立窗口
+- ✨ 使用 QStackedWidget 延迟创建页面，优化内存占用
+- ✨ 页面切换时可选择是否清空数据
+- ✨ 独立窗口模式下曲线图最小高度 200px，可滚动显示
+- ✨ 报警配置改为标签页切换
+- ✨ 模式切换时，正在采集或有数据都弹出确认对话框
+
+### v0.2.0 (2026-05-14)
+- ✨ 双路模式改为单串口接收（双路共用一个串口）
+- ✨ 数据格式改为二进制帧（起始位 0xAA + 通道标识 + 温度数据 + XOR 校验 + 结束位 0x0A）
+- ✨ 优化配置结构（串口配置移至顶层）
+- ✨ 简化工具栏按钮（开始采集/停止采集）
 
 ### v0.1.0 (2026-05-14)
 - ✨ 初始版本发布

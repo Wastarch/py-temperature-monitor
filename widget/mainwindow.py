@@ -2,13 +2,15 @@
 温度采集系统上位机 - 主窗口模块
 
 功能：
-- 单路/双路温度采集模式切换
+- 1-8路温度采集模式切换
 - 串口配置（支持扫描虚拟串口）
-- 实时温度显示（大字体）
-- pyqtgraph 实时曲线图（独立子图）
+- 实时温度表格显示
+- pyqtgraph 实时曲线图（合并窗口/独立窗口模式）
+- 使用 QStackedWidget 延迟创建页面，优化内存占用
 - 按通道独立报警（温度超限变红）
 - 数据导出（CSV / Excel）
 - 配置持久化（config.json）
+- 原始数据日志显示
 """
 
 import json
@@ -23,8 +25,10 @@ from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
     QFileDialog,
+    QGridLayout,
     QGroupBox,
     QHBoxLayout,
+    QHeaderView,
     QInputDialog,
     QLabel,
     QMainWindow,
@@ -33,7 +37,11 @@ from PySide6.QtWidgets import (
     QPushButton,
     QScrollArea,
     QSpinBox,
+    QStackedWidget,
     QStatusBar,
+    QTabWidget,
+    QTableWidget,
+    QTableWidgetItem,
     QToolBar,
     QVBoxLayout,
     QWidget,
@@ -43,17 +51,25 @@ from core.alarm import AlarmManager
 from core.data_manager import DataManager
 from widget.serial_worker import SerialWorker, list_available_ports
 
-# 配置文件路径（项目根目录下的 config.json）
+# 配置文件路径
 CONFIG_FILE = os.path.join(os.path.dirname(os.path.dirname(__file__)), "config.json")
 
-# 支持的波特率列表
+# 常量
 BAUDRATES = ["4800", "9600", "19200", "38400", "57600", "115200"]
-
-# 曲线显示时长选项（标签: 秒数，0 表示全部）
 DISPLAY_OPTIONS = {"1分钟": 60, "5分钟": 300, "10分钟": 600, "30分钟": 1800, "全部": 0}
-
-# 各通道曲线颜色
-CURVE_COLORS = ["#00BFFF", "#FF6347"]
+CURVE_COLORS = [
+    "#00BFFF",  # 蓝色
+    "#FF6347",  # 红色
+    "#32CD32",  # 绿色
+    "#FFD700",  # 金色
+    "#9370DB",  # 紫色
+    "#FF69B4",  # 粉色
+    "#00CED1",  # 青色
+    "#FF8C00",  # 橙色
+]
+CURVE_DISPLAY_MODES = {"合并窗口": "merged", "独立窗口": "separate"}
+CURVE_MIN_HEIGHT = 200
+TABLE_COL_WIDTH = 80
 
 
 class MainWindow(QMainWindow):
@@ -62,7 +78,7 @@ class MainWindow(QMainWindow):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle("温度采集系统")
-        self.resize(1400, 800)
+        self.resize(1200, 700)
 
         # 加载配置
         self.config = self._load_config()
@@ -71,27 +87,29 @@ class MainWindow(QMainWindow):
         self.data_manager = DataManager(max_records=self.config.get("acquisition", {}).get("max_records", 10000))
         self.alarm_manager = AlarmManager()
 
-        # 串口工作线程字典: {通道号: SerialWorker}
-        self.serial_workers: dict[int, SerialWorker] = {}
+        # 串口工作线程
+        self.serial_worker: SerialWorker | None = None
 
-        # 曲线显示时长（秒）
+        # 曲线显示时长
         self._display_seconds = self.config.get("acquisition", {}).get("display_seconds", 300)
 
-        # UI 控件引用字典（用于后续访问）
-        self._combo_widgets: dict[str, dict[int, QWidget]] = {
-            "port": {},
-            "baudrate": {},
-            "alarm_enabled": {},
-            "alarm_low": {},
-            "alarm_high": {},
-        }
-        self._temp_labels: dict[int, QLabel] = {}        # 温度显示标签
-        self._status_labels: dict[int, QLabel] = {}      # 状态标签
-        self._plots: dict[int, pg.PlotWidget] = {}        # 曲线图控件
-        self._curves: dict[int, pg.PlotDataItem] = {}     # 曲线数据项
-        self._plot_data: dict[int, tuple[list, list]] = {}  # 曲线原始数据 (x列表, y列表)
-        self._channel_frames: dict[int, QWidget] = {}    # 通道显示区域容器
-        self._log_text: QPlainTextEdit = None             # 原始数据日志控件
+        # QStackedWidget 相关
+        self._stacked_widget: QStackedWidget = None
+        self._loading_page: QWidget = None
+
+        # 页面缓存
+        self._created_pages: dict[int, QWidget] = {}
+        self._page_plots: dict[int, dict[int, pg.PlotWidget]] = {}
+        self._page_curves: dict[int, dict[int, pg.PlotDataItem]] = {}
+        self._page_plot_data: dict[int, dict[int, tuple[list, list]]] = {}
+
+        # 当前状态
+        self._current_page_index: int = -1
+        self._current_channel_count: int = 1
+        self._current_curve_mode: str = "merged"
+
+        # 温度表格
+        self._temp_table: QTableWidget = None
 
         # 初始化 UI
         self._setup_ui()
@@ -99,39 +117,26 @@ class MainWindow(QMainWindow):
         self._apply_config()
         self._scan_ports()
 
-        # 定时刷新曲线（每 200ms）
+        # 定时刷新曲线
         self._update_timer = QTimer(self)
         self._update_timer.timeout.connect(self._update_all_curves)
-        self._update_timer.start(200)
+        interval_ms = self.config.get("acquisition", {}).get("interval_ms", 1000)
+        self._update_timer.start(interval_ms)
 
     # ==================== 配置管理 ====================
 
     def _load_config(self) -> dict:
-        """
-        加载配置文件
-
-        Returns:
-            配置字典，如果文件不存在或加载失败则返回默认配置
-        """
         default = {
-            "mode": "single",
-            "channels": {
-                "1": {
-                    "serial": {"port": "COM3", "baudrate": 9600},
-                    "alarm": {"enabled": True, "low_limit": 0.0, "high_limit": 50.0},
-                },
-                "2": {
-                    "serial": {"port": "COM4", "baudrate": 9600},
-                    "alarm": {"enabled": True, "low_limit": 0.0, "high_limit": 50.0},
-                },
-            },
-            "acquisition": {"max_records": 10000, "display_seconds": 300},
+            "mode": 1,
+            "curve_mode": "merged",
+            "serial": {"port": "COM11", "baudrate": 9600},
+            "channels": {str(i): {"alarm": {"enabled": True, "low_limit": 0, "high_limit": 50}} for i in range(1, 9)},
+            "acquisition": {"max_records": 10000, "display_seconds": 300, "interval_ms": 1000},
         }
         if os.path.exists(CONFIG_FILE):
             try:
                 with open(CONFIG_FILE, "r", encoding="utf-8") as f:
                     saved = json.load(f)
-                # 合并保存的配置到默认配置
                 for key in default:
                     if key in saved:
                         if isinstance(default[key], dict):
@@ -143,27 +148,20 @@ class MainWindow(QMainWindow):
         return default
 
     def _save_config(self):
-        """保存当前配置到文件"""
-        self.config["mode"] = self._mode_combo.currentData()
-        # 保存各通道配置
-        for ch in [1, 2]:
+        self.config["mode"] = self._current_channel_count
+        self.config["curve_mode"] = self._current_curve_mode
+        self.config["serial"]["port"] = self._port_combo.currentText()
+        self.config["serial"]["baudrate"] = int(self._baudrate_combo.currentText())
+        for ch in range(1, 9):
             ch_key = str(ch)
             if ch_key not in self.config["channels"]:
-                self.config["channels"][ch_key] = {
-                    "serial": {"port": "COM3", "baudrate": 9600},
-                    "alarm": {"enabled": True, "low_limit": 0.0, "high_limit": 50.0},
-                }
-            if ch in self._combo_widgets["port"]:
-                self.config["channels"][ch_key]["serial"]["port"] = self._combo_widgets["port"][ch].currentText()
-            if ch in self._combo_widgets["baudrate"]:
-                self.config["channels"][ch_key]["serial"]["baudrate"] = int(self._combo_widgets["baudrate"][ch].currentText())
-            if ch in self._combo_widgets["alarm_enabled"]:
-                self.config["channels"][ch_key]["alarm"]["enabled"] = self._combo_widgets["alarm_enabled"][ch].isChecked()
-            if ch in self._combo_widgets["alarm_low"]:
-                self.config["channels"][ch_key]["alarm"]["low_limit"] = self._combo_widgets["alarm_low"][ch].value()
-            if ch in self._combo_widgets["alarm_high"]:
-                self.config["channels"][ch_key]["alarm"]["high_limit"] = self._combo_widgets["alarm_high"][ch].value()
+                self.config["channels"][ch_key] = {"alarm": {"enabled": True, "low_limit": 0, "high_limit": 50}}
+            self.config["channels"][ch_key]["alarm"]["enabled"] = self._alarm_enabled_cbs[ch].isChecked()
+            self.config["channels"][ch_key]["alarm"]["low_limit"] = self._alarm_low_spins[ch].value()
+            self.config["channels"][ch_key]["alarm"]["high_limit"] = self._alarm_high_spins[ch].value()
         self.config["acquisition"]["display_seconds"] = self._display_seconds
+        self.config["acquisition"]["max_records"] = self.data_manager.max_records
+        self.config["acquisition"]["interval_ms"] = self._interval_spin.value()
         try:
             with open(CONFIG_FILE, "w", encoding="utf-8") as f:
                 json.dump(self.config, f, ensure_ascii=False, indent=4)
@@ -171,58 +169,63 @@ class MainWindow(QMainWindow):
             pass
 
     def _apply_config(self):
-        """将保存的配置应用到 UI 控件"""
-        mode = self.config.get("mode", "single")
-        idx = self._mode_combo.findData(mode)
-        if idx >= 0:
-            self._mode_combo.setCurrentIndex(idx)
-        self._switch_mode(mode)
-        # 设置显示时长
+        mode = self.config.get("mode", 1)
+        curve_mode = self.config.get("curve_mode", "merged")
+        if isinstance(mode, str):
+            mode = 1
+        self._channel_combo.blockSignals(True)
+        self._curve_mode_combo.blockSignals(True)
+        self._channel_combo.setCurrentIndex(self._channel_combo.findData(mode))
+        self._curve_mode_combo.setCurrentIndex(self._curve_mode_combo.findData(curve_mode))
+        self._channel_combo.blockSignals(False)
+        self._curve_mode_combo.blockSignals(False)
+        serial_cfg = self.config.get("serial", {})
+        self._port_combo.setCurrentText(serial_cfg.get("port", "COM11"))
+        self._baudrate_combo.setCurrentText(str(serial_cfg.get("baudrate", 9600)))
+        for ch in range(1, 9):
+            alarm_cfg = self.config.get("channels", {}).get(str(ch), {}).get("alarm", {})
+            self._alarm_enabled_cbs[ch].setChecked(alarm_cfg.get("enabled", True))
+            self._alarm_low_spins[ch].setValue(int(alarm_cfg.get("low_limit", 0)))
+            self._alarm_high_spins[ch].setValue(int(alarm_cfg.get("high_limit", 50)))
         self._display_seconds = self.config.get("acquisition", {}).get("display_seconds", 300)
         for text, secs in DISPLAY_OPTIONS.items():
             if secs == self._display_seconds:
                 self._display_duration_combo.setCurrentText(text)
                 break
+        interval_ms = self.config.get("acquisition", {}).get("interval_ms", 1000)
+        self._interval_spin.setValue(interval_ms)
+        self._switch_mode(mode, curve_mode)
 
     # ==================== UI 构建 ====================
 
     def _setup_ui(self):
-        """构建主窗口 UI 布局"""
         self._create_toolbar()
-
-        # 中心部件：左侧配置面板 + 右侧数据显示区
         central = QWidget()
         self.setCentralWidget(central)
         main_layout = QHBoxLayout(central)
-
-        # 左侧区域：配置面板 + 日志面板
-        left_area = QWidget()
-        left_layout = QVBoxLayout(left_area)
-        left_layout.setContentsMargins(0, 0, 0, 0)
-
-        # 配置面板（可滚动）
         self._config_panel = self._create_config_panel()
-        left_layout.addWidget(self._config_panel, 2)  # 比例 2/3
-
-        # 原始数据日志面板
-        # log_panel = self._create_log_panel()
-        # left_layout.addWidget(log_panel, 1)  # 比例 1/3
-
-        main_layout.addWidget(left_area, 1)  # 左侧整体比例 1
+        main_layout.addWidget(self._config_panel, 1)
 
         # 中间数据显示区
         self._data_area = QWidget()
         self._data_layout = QVBoxLayout(self._data_area)
-        main_layout.addWidget(self._data_area, 3)  # 比例 3
 
-        # 右侧区域：原始数据日志面板
-        self._log_area = QWidget()
-        self._log_layout = QVBoxLayout(self._log_area)
+        # 温度表格（共享）
+        self._temp_table = self._create_temp_table()
+        self._data_layout.addWidget(self._temp_table)
+
+        # QStackedWidget
+        self._stacked_widget = QStackedWidget()
+        self._data_layout.addWidget(self._stacked_widget)
+
+        # 创建加载页面
+        self._loading_page = self._create_loading_page()
+        self._stacked_widget.addWidget(self._loading_page)
+        main_layout.addWidget(self._data_area, 3)
+
+        # 日志面板
         log_panel = self._create_log_panel()
-        self._log_layout.addWidget(log_panel)
-        main_layout.addWidget(self._log_area, 1)  # 右侧整体比例 1
-
-    
+        main_layout.addWidget(log_panel, 1)
 
         # 状态栏
         self._status_bar = QStatusBar()
@@ -230,22 +233,17 @@ class MainWindow(QMainWindow):
         self._status_bar.showMessage("就绪")
 
     def _create_toolbar(self):
-        """创建工具栏"""
         toolbar = QToolBar("工具栏")
         toolbar.setMovable(False)
         self.addToolBar(toolbar)
-
-        # 创建工具栏按钮
-        self._start_all_action = QAction("▶ 全部开始", self)
-        self._stop_all_action = QAction("⏹ 全部停止", self)
-        self._stop_all_action.setEnabled(False)
+        self._start_action = QAction("▶ 开始采集", self)
+        self._stop_action = QAction("⏹ 停止采集", self)
+        self._stop_action.setEnabled(False)
         self._export_csv_action = QAction("导出CSV", self)
         self._export_excel_action = QAction("导出Excel", self)
         self._clear_action = QAction("清空数据", self)
-
-        # 添加到工具栏
-        toolbar.addAction(self._start_all_action)
-        toolbar.addAction(self._stop_all_action)
+        toolbar.addAction(self._start_action)
+        toolbar.addAction(self._stop_action)
         toolbar.addSeparator()
         toolbar.addAction(self._export_csv_action)
         toolbar.addAction(self._export_excel_action)
@@ -253,11 +251,9 @@ class MainWindow(QMainWindow):
         toolbar.addAction(self._clear_action)
 
     def _create_config_panel(self) -> QScrollArea:
-        """创建左侧配置面板"""
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setMaximumWidth(280)
-
         container = QWidget()
         self._config_layout = QVBoxLayout(container)
         self._config_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
@@ -265,24 +261,65 @@ class MainWindow(QMainWindow):
         # 模式选择
         mode_group = QGroupBox("模式选择")
         mode_layout = QVBoxLayout(mode_group)
-        self._mode_combo = QComboBox()
-        self._mode_combo.addItem("单路", "single")
-        self._mode_combo.addItem("双路", "dual")
-        mode_layout.addWidget(self._mode_combo)
+        channel_layout = QHBoxLayout()
+        channel_layout.addWidget(QLabel("通道数:"))
+        self._channel_combo = QComboBox()
+        for i in range(1, 9):
+            self._channel_combo.addItem(f"{i}路", i)
+        channel_layout.addWidget(self._channel_combo)
+        mode_layout.addLayout(channel_layout)
+        curve_layout = QHBoxLayout()
+        curve_layout.addWidget(QLabel("曲线显示:"))
+        self._curve_mode_combo = QComboBox()
+        for text, value in CURVE_DISPLAY_MODES.items():
+            self._curve_mode_combo.addItem(text, value)
+        curve_layout.addWidget(self._curve_mode_combo)
+        mode_layout.addLayout(curve_layout)
         self._config_layout.addWidget(mode_group)
 
-        # 各通道配置（CH1、CH2）
-        self._channel_groups: dict[int, QGroupBox] = {}
-        for ch in [1, 2]:
-            group = self._create_channel_config(ch)
-            self._channel_groups[ch] = group
-            self._config_layout.addWidget(group)
+        # 串口设置
+        serial_group = QGroupBox("串口设置")
+        serial_layout = QVBoxLayout(serial_group)
+        port_layout = QHBoxLayout()
+        port_layout.addWidget(QLabel("COM:"))
+        self._port_combo = QComboBox()
+        self._port_combo.setEditable(True)
+        port_layout.addWidget(self._port_combo)
+        serial_layout.addLayout(port_layout)
+        baud_layout = QHBoxLayout()
+        baud_layout.addWidget(QLabel("波特率:"))
+        self._baudrate_combo = QComboBox()
+        for b in BAUDRATES:
+            self._baudrate_combo.addItem(b)
+        baud_layout.addWidget(self._baudrate_combo)
+        serial_layout.addLayout(baud_layout)
+        scan_btn = QPushButton("扫描串口")
+        scan_btn.clicked.connect(self._scan_ports)
+        serial_layout.addWidget(scan_btn)
+        self._config_layout.addWidget(serial_group)
+
+        # 报警配置标签页
+        self._alarm_tab = QTabWidget()
+        self._alarm_enabled_cbs: dict[int, QCheckBox] = {}
+        self._alarm_low_spins: dict[int, QSpinBox] = {}
+        self._alarm_high_spins: dict[int, QSpinBox] = {}
+        for ch in range(1, 9):
+            widget = self._create_alarm_config(ch)
+            self._alarm_tab.addTab(widget, f"CH{ch}")
+        self._config_layout.addWidget(self._alarm_tab)
 
         # 采集设置
         acq_group = QGroupBox("采集设置")
         acq_layout = QVBoxLayout(acq_group)
-
-        # 显示时长选择
+        interval_layout = QHBoxLayout()
+        interval_layout.addWidget(QLabel("采集间隔:"))
+        self._interval_spin = QSpinBox()
+        self._interval_spin.setRange(100, 10000)
+        self._interval_spin.setValue(1000)
+        self._interval_spin.setSingleStep(100)
+        self._interval_spin.setSuffix(" ms")
+        interval_layout.addWidget(self._interval_spin)
+        acq_layout.addLayout(interval_layout)
         dur_layout = QHBoxLayout()
         dur_layout.addWidget(QLabel("显示时长:"))
         self._display_duration_combo = QComboBox()
@@ -291,8 +328,6 @@ class MainWindow(QMainWindow):
         self._display_duration_combo.setCurrentText("5分钟")
         dur_layout.addWidget(self._display_duration_combo)
         acq_layout.addLayout(dur_layout)
-
-        # 最大记录数
         rec_layout = QHBoxLayout()
         rec_layout.addWidget(QLabel("最大记录数:"))
         self._max_records_spin = QSpinBox()
@@ -301,90 +336,20 @@ class MainWindow(QMainWindow):
         self._max_records_spin.setSingleStep(1000)
         rec_layout.addWidget(self._max_records_spin)
         acq_layout.addLayout(rec_layout)
-
         self._config_layout.addWidget(acq_group)
         self._config_layout.addStretch()
 
         scroll.setWidget(container)
         return scroll
 
-    def _create_log_panel(self) -> QGroupBox:
-        """创建原始数据日志面板"""
-        group = QGroupBox("原始数据日志")
-        layout = QVBoxLayout(group)
-
-        # 日志文本框（只读，自动滚动）
-        self._log_text = QPlainTextEdit()
-        self._log_text.setReadOnly(True)
-        self._log_text.setMaximumBlockCount(1000)  # 最多保留 1000 行
-        self._log_text.setStyleSheet("font-family: Consolas, monospace; font-size: 12px;")
-        self._log_text.setMinimumWidth(250)
-        layout.addWidget(self._log_text)
-
-        # 清空按钮
-        clear_btn = QPushButton("清空日志")
-        clear_btn.clicked.connect(self._log_text.clear)
-        layout.addWidget(clear_btn)
-
-        return group
-
-    def _create_channel_config(self, ch: int) -> QGroupBox:
-        """
-        创建单个通道的配置组
-
-        Args:
-            ch: 通道号（1 或 2）
-
-        Returns:
-            包含串口设置和报警设置的 QGroupBox
-        """
-        group = QGroupBox(f"CH{ch} 配置")
-        layout = QVBoxLayout(group)
-
-        # 从配置文件读取该通道的默认值
-        ch_cfg = self.config.get("channels", {}).get(str(ch), {})
-        serial_cfg = ch_cfg.get("serial", {})
-        alarm_cfg = ch_cfg.get("alarm", {})
-
-        # ---- 串口设置 ----
-        layout.addWidget(QLabel("串口设置"))
-
-        # COM 口选择（可编辑，支持手动输入）
-        port_layout = QHBoxLayout()
-        port_layout.addWidget(QLabel("COM:"))
-        port_combo = QComboBox()
-        port_combo.setEditable(True)
-        port_combo.setCurrentText(serial_cfg.get("port", f"COM{ch + 2}"))
-        port_layout.addWidget(port_combo)
-        layout.addLayout(port_layout)
-        self._combo_widgets["port"][ch] = port_combo
-
-        # 波特率选择
-        baud_layout = QHBoxLayout()
-        baud_layout.addWidget(QLabel("波特率:"))
-        baud_combo = QComboBox()
-        for b in BAUDRATES:
-            baud_combo.addItem(b)
-        baud_combo.setCurrentText(str(serial_cfg.get("baudrate", 9600)))
-        baud_layout.addWidget(baud_combo)
-        layout.addLayout(baud_layout)
-        self._combo_widgets["baudrate"][ch] = baud_combo
-
-        # 扫描串口按钮
-        scan_btn = QPushButton("扫描串口")
-        scan_btn.clicked.connect(lambda checked, c=ch: self._scan_ports_for_channel(c))
-        layout.addWidget(scan_btn)
-
-        # ---- 报警设置 ----
-        layout.addWidget(QLabel("报警设置"))
-
-        # 启用报警复选框
+    def _create_alarm_config(self, ch: int) -> QWidget:
+        widget = QWidget()
+        layout = QVBoxLayout(widget)
+        alarm_cfg = self.config.get("channels", {}).get(str(ch), {}).get("alarm", {})
         enabled_cb = QCheckBox("启用报警")
         enabled_cb.setChecked(alarm_cfg.get("enabled", True))
         layout.addWidget(enabled_cb)
-        self._combo_widgets["alarm_enabled"][ch] = enabled_cb
-
-        # 温度下限
+        self._alarm_enabled_cbs[ch] = enabled_cb
         low_layout = QHBoxLayout()
         low_layout.addWidget(QLabel("下限:"))
         low_spin = QSpinBox()
@@ -393,9 +358,7 @@ class MainWindow(QMainWindow):
         low_layout.addWidget(low_spin)
         low_layout.addWidget(QLabel("°C"))
         layout.addLayout(low_layout)
-        self._combo_widgets["alarm_low"][ch] = low_spin
-
-        # 温度上限
+        self._alarm_low_spins[ch] = low_spin
         high_layout = QHBoxLayout()
         high_layout.addWidget(QLabel("上限:"))
         high_spin = QSpinBox()
@@ -404,544 +367,510 @@ class MainWindow(QMainWindow):
         high_layout.addWidget(high_spin)
         high_layout.addWidget(QLabel("°C"))
         layout.addLayout(high_layout)
-        self._combo_widgets["alarm_high"][ch] = high_spin
+        self._alarm_high_spins[ch] = high_spin
+        self.alarm_manager.setup_channel(ch, low=low_spin.value(), high=high_spin.value(), enabled=enabled_cb.isChecked())
+        layout.addStretch()
+        return widget
 
-        # 初始化报警管理器的通道配置
-        self.alarm_manager.setup_channel(
-            ch,
-            low=low_spin.value(),
-            high=high_spin.value(),
-            enabled=enabled_cb.isChecked(),
-        )
-
+    def _create_log_panel(self) -> QGroupBox:
+        group = QGroupBox("原始数据日志")
+        layout = QVBoxLayout(group)
+        self._log_text = QPlainTextEdit()
+        self._log_text.setReadOnly(True)
+        self._log_text.setMaximumBlockCount(1000)
+        self._log_text.setStyleSheet("font-family: Consolas, monospace; font-size: 12px;")
+        self._log_text.setMinimumWidth(250)
+        self._log_text.setMaximumWidth(500)
+        layout.addWidget(self._log_text)
+        clear_btn = QPushButton("清空日志")
+        clear_btn.clicked.connect(self._log_text.clear)
+        layout.addWidget(clear_btn)
         return group
 
-    def _build_channel_display(self, ch: int):
-        """
-        构建单个通道的数据显示区域
+    def _create_loading_page(self) -> QWidget:
+        """创建加载页面"""
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        loading_label = QLabel("正在加载，请稍候...")
+        loading_label.setFont(QFont("Microsoft YaHei", 16))
+        loading_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        loading_label.setStyleSheet("color: #666666;")
+        layout.addWidget(loading_label)
+        return page
 
-        Args:
-            ch: 通道号（1 或 2）
-        """
-        frame = QWidget()
-        frame_layout = QVBoxLayout(frame)
-        frame_layout.setContentsMargins(0, 0, 0, 0)
+    def _create_temp_table(self) -> QTableWidget:
+        """创建温度表格"""
+        table = QTableWidget(1, 8)
+        table.setHorizontalHeaderLabels([f"CH{i}" for i in range(1, 9)])
+        table.verticalHeader().setVisible(False)
+        table.setFixedHeight(60)
+        header = table.horizontalHeader()
+        header.setSectionResizeMode(QHeaderView.ResizeMode.Fixed)
+        header.setDefaultSectionSize(TABLE_COL_WIDTH)
+        for col in range(8):
+            item = QTableWidgetItem("-- °C")
+            item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            table.setItem(0, col, item)
+        return table
 
-        # ---- 头部：温度显示 + 状态 + 独立控制按钮 ----
-        header = QWidget()
-        header_layout = QHBoxLayout(header)
-        header_layout.setContentsMargins(0, 0, 0, 0)
+    # ==================== 页面索引 ====================
 
-        # 温度大字体显示
-        temp_label = QLabel(f"CH{ch}: -- °C")
-        temp_label.setFont(QFont("Microsoft YaHei", 24, QFont.Weight.Bold))
-        temp_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self._temp_labels[ch] = temp_label
-        header_layout.addWidget(temp_label)
+    def _get_page_index(self, channel_count: int, curve_mode: str) -> int:
+        base = (channel_count - 1) * 2
+        if curve_mode == "separate":
+            base += 1
+        return base
 
-        # 报警状态标签
-        status_label = QLabel("[正常]")
-        status_label.setFont(QFont("Microsoft YaHei", 12))
-        status_label.setStyleSheet("color: green;")
-        self._status_labels[ch] = status_label
-        header_layout.addWidget(status_label)
+    def _calc_cols(self, num_channels: int) -> int:
+        if num_channels <= 2:
+            return num_channels
+        elif num_channels <= 4:
+            return 2
+        elif num_channels <= 6:
+            return 3
+        else:
+            return 4
 
-        # 独立开始/停止按钮
-        start_btn = QPushButton("▶开始")
-        start_btn.setFixedWidth(60)
-        start_btn.clicked.connect(lambda checked, c=ch: self._start_channel(c))
-        header_layout.addWidget(start_btn)
+    # ==================== 页面创建 ====================
 
-        stop_btn = QPushButton("⏹停止")
-        stop_btn.setFixedWidth(60)
-        stop_btn.clicked.connect(lambda checked, c=ch: self._stop_channel(c))
-        header_layout.addWidget(stop_btn)
+    def _create_page(self, channel_count: int, curve_mode: str) -> QWidget:
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(0, 0, 0, 0)
+        channels = list(range(1, channel_count + 1))
+        plots = {}
+        curves = {}
+        plot_data = {}
 
-        frame_layout.addWidget(header)
+        if curve_mode == "merged":
+            # 合并窗口模式：一个图表，多条曲线
+            plot_widget = pg.PlotWidget(title="实时温度曲线")
+            plot_widget.setLabel("left", "温度", units="°C")
+            plot_widget.setLabel("bottom", "时间")
+            plot_widget.showGrid(x=True, y=True, alpha=0.3)
+            plot_widget.setBackground("#1e1e2e")
+            plot_widget.setYRange(0, 100)
 
-        # ---- 实时曲线图 ----
+            for ch in channels:
+                color = CURVE_COLORS[(ch - 1) % len(CURVE_COLORS)]
+                pen = pg.mkPen(color=color, width=2)
+                curve = plot_widget.plot(pen=pen, name=f"CH{ch}")
+                curves[ch] = curve
+                plot_data[ch] = ([], [])
+
+            plots[0] = plot_widget
+            layout.addWidget(plot_widget)
+
+            # 图例行（居中显示，带线条样式）
+            legend_widget = QWidget()
+            legend_layout = QHBoxLayout(legend_widget)
+            legend_layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            legend_layout.setContentsMargins(0, 5, 0, 0)
+
+            for ch in channels:
+                color = CURVE_COLORS[(ch - 1) % len(CURVE_COLORS)]
+                legend_item = QWidget()
+                item_layout = QHBoxLayout(legend_item)
+                item_layout.setContentsMargins(5, 0, 5, 0)
+                line_label = QLabel("—")
+                line_label.setStyleSheet(f"color: {color}; font-size: 24px;font-weight: bold;")
+                item_layout.addWidget(line_label)
+                name_label = QLabel(f"CH{ch}")
+                name_label.setStyleSheet(f"font-size: 12px;")
+                item_layout.addWidget(name_label)
+                legend_layout.addWidget(legend_item)
+
+            layout.addWidget(legend_widget)
+        else:
+            scroll = QScrollArea()
+            scroll.setWidgetResizable(True)
+            container = QWidget()
+            container_layout = QVBoxLayout(container)
+            for ch in channels:
+                plot_widget, curve = self._create_curve_widget(ch)
+                plot_widget.setMinimumHeight(CURVE_MIN_HEIGHT)
+                container_layout.addWidget(plot_widget)
+                plots[ch] = plot_widget
+                curves[ch] = curve
+                plot_data[ch] = ([], [])
+            container_layout.addStretch()
+            scroll.setWidget(container)
+            layout.addWidget(scroll)
+
+        page_index = self._get_page_index(channel_count, curve_mode)
+        self._page_plots[page_index] = plots
+        self._page_curves[page_index] = curves
+        self._page_plot_data[page_index] = plot_data
+        return page
+
+    def _create_curve_widget(self, ch: int) -> tuple[pg.PlotWidget, pg.PlotDataItem]:
         plot_widget = pg.PlotWidget(title=f"CH{ch} 实时温度曲线")
         plot_widget.setLabel("left", "温度", units="°C")
         plot_widget.setLabel("bottom", "时间")
         plot_widget.showGrid(x=True, y=True, alpha=0.3)
         plot_widget.setBackground("#1e1e2e")
-
-        # 创建曲线（使用对应通道的颜色）
-        color = CURVE_COLORS[ch - 1] if ch <= len(CURVE_COLORS) else "#FFFFFF"
+        color = CURVE_COLORS[(ch - 1) % len(CURVE_COLORS)]
         pen = pg.mkPen(color=color, width=2)
         curve = plot_widget.plot(pen=pen)
-        self._curves[ch] = curve
-        self._plots[ch] = plot_widget
-        self._plot_data[ch] = ([], [])  # 初始化空数据
+        return plot_widget, curve
 
-        frame_layout.addWidget(plot_widget)
-        self._data_layout.addWidget(frame)
-        self._channel_frames[ch] = frame
+    def _load_history_to_page(self, page_index: int, channel_count: int):
+        if page_index not in self._page_plot_data:
+            return
+        channels = list(range(1, channel_count + 1))
+        for ch in channels:
+            history = self.data_manager.get_history(ch, seconds=0)
+            if history and ch in self._page_plot_data[page_index]:
+                x_data, y_data = self._page_plot_data[page_index][ch]
+                if history:
+                    base_time = history[0][0].timestamp()
+                    for ts, temp in history:
+                        x_data.append(ts.timestamp() - base_time)
+                        y_data.append(temp)
+                    if ch in self._page_curves[page_index]:
+                        self._page_curves[page_index][ch].setData(x_data, y_data)
 
     # ==================== 信号连接 ====================
 
     def _connect_signals(self):
-        """连接所有信号槽"""
-        # 模式切换
-        self._mode_combo.currentIndexChanged.connect(self._on_mode_changed)
-
-        # 工具栏按钮
-        self._start_all_action.triggered.connect(self._start_all)
-        self._stop_all_action.triggered.connect(self._stop_all)
+        """
+        连接各种UI控件与对应的处理函数，建立信号与槽的连接关系
+        """
+        # 连接通道和曲线模式选择框的变更事件
+        self._channel_combo.currentIndexChanged.connect(self._on_mode_changed)
+        self._curve_mode_combo.currentIndexChanged.connect(self._on_mode_changed)
+        # 连接开始和停止采集按钮的触发事件
+        self._start_action.triggered.connect(self._start_acquisition)
+        self._stop_action.triggered.connect(self._stop_acquisition)
+        # 连接导出功能的触发事件
         self._export_csv_action.triggered.connect(self._export_csv)
         self._export_excel_action.triggered.connect(self._export_excel)
+        # 连接清除数据按钮的触发事件
         self._clear_action.triggered.connect(self._clear_data)
-
-        # 采集设置
+        # 连接时间间隔和显示时长控件的值变更事件
+        self._interval_spin.valueChanged.connect(self._on_interval_changed)
         self._display_duration_combo.currentTextChanged.connect(self._on_display_duration_changed)
+        # 连接最大记录数控件的值变更事件
         self._max_records_spin.valueChanged.connect(self._on_max_records_changed)
-
-        # 各通道配置控件
-        for ch in [1, 2]:
-            # 报警启用/禁用
-            self._combo_widgets["alarm_enabled"][ch].toggled.connect(
-                lambda checked, c=ch: self.alarm_manager.set_enabled(c, checked)
-            )
-            # 报警阈值变化
-            self._combo_widgets["alarm_low"][ch].valueChanged.connect(
-                lambda val, c=ch: self.alarm_manager.set_limits(
-                    c, val, self._combo_widgets["alarm_high"][c].value()
-                )
-            )
-            self._combo_widgets["alarm_high"][ch].valueChanged.connect(
-                lambda val, c=ch: self.alarm_manager.set_limits(
-                    c, self._combo_widgets["alarm_low"][c].value(), val
-                )
-            )
-            # 串口选择变化（触发端口过滤）
-            self._combo_widgets["port"][ch].currentTextChanged.connect(
-                lambda text, c=ch: self._on_port_changed(c)
-            )
-
-        # 报警信号
+        # 为每个通道(1-8)连接报警相关的控件事件
+        for ch in range(1, 9):
+            # 连接报警使能复选框的切换事件
+            self._alarm_enabled_cbs[ch].toggled.connect(lambda checked, c=ch: self.alarm_manager.set_enabled(c, checked))
+            # 连接报警下限值输入框的值变更事件
+            self._alarm_low_spins[ch].valueChanged.connect(lambda val, c=ch: self.alarm_manager.set_limits(c, val, self._alarm_high_spins[c].value()))
+            # 连接报警上限值输入框的值变更事件
+            self._alarm_high_spins[ch].valueChanged.connect(lambda val, c=ch: self.alarm_manager.set_limits(c, self._alarm_low_spins[c].value(), val))
+        # 连接报警管理器的报警触发和清除事件
         self.alarm_manager.alarm_triggered.connect(self._on_alarm_triggered)
         self.alarm_manager.alarm_cleared.connect(self._on_alarm_cleared)
 
     # ==================== 模式切换 ====================
 
     def _on_mode_changed(self):
-        """模式切换事件处理"""
-        new_mode = self._mode_combo.currentData()
-        if not new_mode:
-            return
-        current_mode = self.config.get("mode", "single")
-        if new_mode == current_mode:
+        new_channel_count = self._channel_combo.currentData()
+        new_curve_mode = self._curve_mode_combo.currentData()
+        if new_channel_count == self._current_channel_count and new_curve_mode == self._current_curve_mode:
             return
 
-        # 如果正在采集，弹出确认对话框
-        if self.serial_workers:
+        need_confirm = False
+        confirm_msg = ""
+        if self.serial_worker is not None and self.serial_worker.isRunning():
+            need_confirm = True
+            confirm_msg = "正在采集中，切换模式将停止采集，是否继续？"
+        elif self._has_data():
+            need_confirm = True
+            confirm_msg = '存在历史数据，是否清空曲线数据？\n（选择"是"清空数据并释放旧页面，选择"否"保留数据）'
+
+        clear_data = False
+        if need_confirm:
             reply = QMessageBox.question(
-                self,
-                "切换模式",
-                "切换模式将停止当前采集并清空数据，是否继续？",
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                self, "切换模式", confirm_msg,
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No | QMessageBox.StandardButton.Cancel,
                 QMessageBox.StandardButton.No,
             )
-            if reply != QMessageBox.StandardButton.Yes:
-                # 用户取消，恢复原选择
-                self._mode_combo.blockSignals(True)
-                idx = self._mode_combo.findData(current_mode)
-                self._mode_combo.setCurrentIndex(idx)
-                self._mode_combo.blockSignals(False)
+            if reply == QMessageBox.StandardButton.Cancel:
+                self._channel_combo.blockSignals(True)
+                self._curve_mode_combo.blockSignals(True)
+                self._channel_combo.setCurrentIndex(self._channel_combo.findData(self._current_channel_count))
+                self._curve_mode_combo.setCurrentIndex(self._curve_mode_combo.findData(self._current_curve_mode))
+                self._channel_combo.blockSignals(False)
+                self._curve_mode_combo.blockSignals(False)
                 return
+            elif reply == QMessageBox.StandardButton.Yes:
+                clear_data = True
 
-        # 停止采集、清空数据、切换 UI
-        self._stop_all()
-        self.data_manager.clear()
-        self._switch_mode(new_mode)
-        self.config["mode"] = new_mode
+        self._stop_acquisition()
+        old_page_index = self._current_page_index
+        if clear_data:
+            self.data_manager.clear()
+        self._switch_mode(new_channel_count, new_curve_mode)
+        if clear_data and old_page_index >= 0:
+            self._release_page(old_page_index)
 
-    def _switch_mode(self, mode: str):
-        """
-        切换单路/双路模式，重建数据显示区
+    def _has_data(self) -> bool:
+        for ch in range(1, 9):
+            if self.data_manager.record_count(ch) > 0:
+                return True
+        return False
 
-        Args:
-            mode: "single" 或 "dual"
-        """
-        # 清除旧的数据显示区
-        for ch in list(self._channel_frames.keys()):
-            frame = self._channel_frames.pop(ch)
-            self._data_layout.removeWidget(frame)
-            frame.deleteLater()
-        for ch in list(self._plots.keys()):
-            self._plots.pop(ch, None)
-            self._curves.pop(ch, None)
-            self._plot_data.pop(ch, None)
-            self._temp_labels.pop(ch, None)
-            self._status_labels.pop(ch, None)
+    def _switch_mode(self, channel_count: int, curve_mode: str):
+        page_index = self._get_page_index(channel_count, curve_mode)
+        if page_index in self._created_pages:
+            self._apply_switch(page_index, channel_count, curve_mode)
+            return
+        self._stacked_widget.setCurrentWidget(self._loading_page)
+        QTimer.singleShot(100, lambda: self._create_and_switch_page(page_index, channel_count, curve_mode))
 
-        # 确定当前模式的通道列表
-        channels = [1] if mode == "single" else [1, 2]
+    def _create_and_switch_page(self, page_index: int, channel_count: int, curve_mode: str):
+        page = self._create_page(channel_count, curve_mode)
+        self._stacked_widget.addWidget(page)
+        self._created_pages[page_index] = page
+        self._load_history_to_page(page_index, channel_count)
+        self._apply_switch(page_index, channel_count, curve_mode)
 
-        # 显示/隐藏配置面板中的通道配置组
-        for ch in channels:
-            self._channel_groups[ch].setVisible(True)
-        for ch in [1, 2]:
-            if ch not in channels:
-                self._channel_groups[ch].setVisible(False)
-
-        # 构建数据显示区
-        for ch in channels:
-            self._build_channel_display(ch)
-
-        self._scan_ports()
+    def _apply_switch(self, page_index: int, channel_count: int, curve_mode: str):
+        page = self._created_pages[page_index]
+        self._stacked_widget.setCurrentWidget(page)
+        self._current_page_index = page_index
+        self._current_channel_count = channel_count
+        self._current_curve_mode = curve_mode
+        for ch in range(1, 9):
+            self._alarm_tab.setTabEnabled(ch - 1, ch <= channel_count)
         self._update_status_bar()
+
+    def _release_page(self, page_index: int):
+        if page_index not in self._created_pages:
+            return
+        page = self._created_pages[page_index]
+        self._stacked_widget.removeWidget(page)
+        page.deleteLater()
+        if page_index in self._page_plots:
+            del self._page_plots[page_index]
+        if page_index in self._page_curves:
+            del self._page_curves[page_index]
+        if page_index in self._page_plot_data:
+            del self._page_plot_data[page_index]
+        if page_index in self._created_pages:
+            del self._created_pages[page_index]
 
     # ==================== 串口扫描 ====================
 
     def _scan_ports(self):
-        """扫描所有可用串口并更新下拉框"""
         ports = list_available_ports()
-        for ch in [1, 2]:
-            if ch not in self._combo_widgets["port"]:
-                continue
-            combo = self._combo_widgets["port"][ch]
-            current = combo.currentText()
-            combo.blockSignals(True)
-            combo.clear()
-            combo.addItems(ports)
-            if current in ports:
-                combo.setCurrentText(current)
-            elif ports:
-                combo.setCurrentIndex(0)
-            else:
-                combo.setCurrentText(current)
-            combo.blockSignals(False)
-
-    def _scan_ports_for_channel(self, ch: int):
-        """
-        为指定通道扫描串口（自动过滤另一通道已选的端口）
-
-        Args:
-            ch: 通道号
-        """
-        ports = list_available_ports()
-        # 过滤掉另一通道已选择的串口
-        other_ch = 2 if ch == 1 else 1
-        if other_ch in self._combo_widgets["port"]:
-            other_port = self._combo_widgets["port"][other_ch].currentText()
-            available = [p for p in ports if p != other_port]
+        current = self._port_combo.currentText()
+        self._port_combo.blockSignals(True)
+        self._port_combo.clear()
+        self._port_combo.addItems(ports)
+        if current in ports:
+            self._port_combo.setCurrentText(current)
+        elif ports:
+            self._port_combo.setCurrentIndex(0)
         else:
-            available = ports
-
-        combo = self._combo_widgets["port"][ch]
-        current = combo.currentText()
-        combo.blockSignals(True)
-        combo.clear()
-        combo.addItems(available)
-        if current in available:
-            combo.setCurrentText(current)
-        elif available:
-            combo.setCurrentIndex(0)
-        else:
-            combo.setCurrentText(current)
-        combo.blockSignals(False)
-
-    def _on_port_changed(self, changed_ch: int):
-        """串口选择变化时，更新另一通道的可选列表"""
-        other_ch = 2 if changed_ch == 1 else 1
-        if other_ch in self._combo_widgets["port"]:
-            self._scan_ports_for_channel(other_ch)
+            self._port_combo.setCurrentText(current)
+        self._port_combo.blockSignals(False)
 
     # ==================== 采集控制 ====================
 
-    def _start_all(self):
-        """开始所有通道的采集"""
-        mode = self._mode_combo.currentData()
-        channels = [1] if mode == "single" else [1, 2]
-        for ch in channels:
-            self._start_channel(ch)
-
-    def _stop_all(self):
-        """停止所有通道的采集"""
-        for ch in list(self.serial_workers.keys()):
-            self._stop_channel(ch)
-
-    def _start_channel(self, ch: int):
-        """
-        启动指定通道的串口采集
-
-        Args:
-            ch: 通道号
-        """
-        # 已在运行则跳过
-        if ch in self.serial_workers and self.serial_workers[ch].isRunning():
+    def _start_acquisition(self):
+        if self.serial_worker is not None and self.serial_worker.isRunning():
             return
-
-        # 读取配置
-        port = self._combo_widgets["port"][ch].currentText()
-        baudrate = int(self._combo_widgets["baudrate"][ch].currentText())
-
+        port = self._port_combo.currentText()
+        baudrate = int(self._baudrate_combo.currentText())
+        interval_ms = self._interval_spin.value()
         if not port:
-            QMessageBox.warning(self, "警告", f"CH{ch} 未选择串口")
+            QMessageBox.warning(self, "警告", "未选择串口")
             return
-
-        # 更新报警配置
-        self.alarm_manager.setup_channel(
-            ch,
-            low=self._combo_widgets["alarm_low"][ch].value(),
-            high=self._combo_widgets["alarm_high"][ch].value(),
-            enabled=self._combo_widgets["alarm_enabled"][ch].isChecked(),
-        )
-
-        # 创建并启动工作线程
-        worker = SerialWorker(ch, port, baudrate)
-        worker.temperature_received.connect(self._on_temperature)
-        worker.raw_data_received.connect(self._on_raw_data)
-        worker.connection_changed.connect(self._on_connection_changed)
-        worker.error_occurred.connect(self._on_serial_error)
-        worker.finished.connect(lambda c=ch: self._on_worker_finished(c))
-        self.serial_workers[ch] = worker
-        worker.start()
-
-        # 禁用配置面板，更新按钮状态
+        channels = list(range(1, self._current_channel_count + 1))
+        for ch in channels:
+            self.alarm_manager.setup_channel(ch, low=self._alarm_low_spins[ch].value(), high=self._alarm_high_spins[ch].value(), enabled=self._alarm_enabled_cbs[ch].isChecked())
+        self.serial_worker = SerialWorker(port, baudrate, interval_ms)
+        self.serial_worker.temperature_received.connect(self._on_temperature)
+        self.serial_worker.raw_data_received.connect(self._on_raw_data)
+        self.serial_worker.connection_changed.connect(self._on_connection_changed)
+        self.serial_worker.error_occurred.connect(self._on_serial_error)
+        self.serial_worker.finished.connect(self._on_worker_finished)
+        self.serial_worker.start()
         self._set_panel_enabled(False)
-        self._start_all_action.setEnabled(False)
-        self._stop_all_action.setEnabled(True)
+        self._start_action.setEnabled(False)
+        self._stop_action.setEnabled(True)
         self._update_status_bar()
 
-    def _stop_channel(self, ch: int):
-        """
-        停止指定通道的采集
-
-        Args:
-            ch: 通道号
-        """
-        if ch in self.serial_workers:
-            worker = self.serial_workers.pop(ch)
-            worker.stop()
-
-        # 如果没有运行中的通道，恢复配置面板
-        if not self.serial_workers:
-            self._set_panel_enabled(True)
-            self._start_all_action.setEnabled(True)
-            self._stop_all_action.setEnabled(False)
+    def _stop_acquisition(self):
+        if self.serial_worker is not None:
+            self.serial_worker.stop()
+            self.serial_worker = None
+        self._set_panel_enabled(True)
+        self._start_action.setEnabled(True)
+        self._stop_action.setEnabled(False)
         self._update_status_bar()
 
-    def _on_worker_finished(self, ch: int):
-        """工作线程结束回调"""
-        self.serial_workers.pop(ch, None)
-        if not self.serial_workers:
-            self._set_panel_enabled(True)
-            self._start_all_action.setEnabled(True)
-            self._stop_all_action.setEnabled(False)
+    def _on_worker_finished(self):
+        self.serial_worker = None
+        self._set_panel_enabled(True)
+        self._start_action.setEnabled(True)
+        self._stop_action.setEnabled(False)
         self._update_status_bar()
 
     def _set_panel_enabled(self, enabled: bool):
-        """
-        启用/禁用配置面板
-
-        Args:
-            enabled: True 启用，False 禁用（采集中禁用）
-        """
-        for ch in [1, 2]:
-            if ch in self._combo_widgets["port"]:
-                self._combo_widgets["port"][ch].setEnabled(enabled)
-            if ch in self._combo_widgets["baudrate"]:
-                self._combo_widgets["baudrate"][ch].setEnabled(enabled)
-            if ch in self._combo_widgets["alarm_enabled"]:
-                self._combo_widgets["alarm_enabled"][ch].setEnabled(enabled)
-            if ch in self._combo_widgets["alarm_low"]:
-                self._combo_widgets["alarm_low"][ch].setEnabled(enabled)
-            if ch in self._combo_widgets["alarm_high"]:
-                self._combo_widgets["alarm_high"][ch].setEnabled(enabled)
-        self._mode_combo.setEnabled(enabled)
+        self._port_combo.setEnabled(enabled)
+        self._baudrate_combo.setEnabled(enabled)
+        self._channel_combo.setEnabled(enabled)
+        self._curve_mode_combo.setEnabled(enabled)
+        for ch in range(1, 9):
+            self._alarm_enabled_cbs[ch].setEnabled(enabled)
+            self._alarm_low_spins[ch].setEnabled(enabled)
+            self._alarm_high_spins[ch].setEnabled(enabled)
+        self._interval_spin.setEnabled(enabled)
         self._max_records_spin.setEnabled(enabled)
 
     # ==================== 数据处理 ====================
 
-    def _on_raw_data(self, ch: int, data: str):
+    def _on_raw_data(self, hex_str: str, result: list[tuple[int, float]]):
         """
         显示原始数据到日志面板
 
         Args:
-            ch: 通道号
-            data: 原始数据字符串
+            hex_str: 原始数据十六进制字符串
+            result: 解析结果 [(通道号, 温度值), ...]
         """
         timestamp = datetime.now().strftime("%H:%M:%S.%f")[:-3]
-        self._log_text.appendPlainText(f"[{timestamp}] CH{ch}: {data}")
-        # 自动滚动到底部
-        self._log_text.verticalScrollBar().setValue(
-            self._log_text.verticalScrollBar().maximum()
-        )
+        channel_count = len(result)
+        channel_info = " ".join([f"CH{ch}：{temp:.1f}°C" for ch, temp in result])
+        log_msg = f"[{timestamp}] {channel_count}通道 {channel_info} -> {hex_str}"
+        self._log_text.appendPlainText(log_msg)
+        self._log_text.verticalScrollBar().setValue(self._log_text.verticalScrollBar().maximum())
 
     def _on_temperature(self, ch: int, temp: float):
-        """
-        接收到温度数据的处理
-
-        Args:
-            ch: 通道号
-            temp: 温度值
-        """
-        # 更新温度显示
-        if ch in self._temp_labels:
-            self._temp_labels[ch].setText(f"CH{ch}: {temp:.1f} °C")
-
-        # 记录数据
+        col = ch - 1
+        if self._temp_table and col < self._temp_table.columnCount():
+            item = QTableWidgetItem(f"{temp:.1f} °C")
+            item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            if self.alarm_manager.get_state(ch) != "NORMAL":
+                item.setForeground(QColor("red"))
+            self._temp_table.setItem(0, col, item)
         now = datetime.now()
         self.data_manager.add_record(ch, temp, now)
-
-        # 更新曲线数据
-        if ch in self._plot_data:
-            x_data, y_data = self._plot_data[ch]
-            x_data.append(now.timestamp())
-            y_data.append(temp)
-
-        # 检查报警
+        page_index = self._current_page_index
+        if page_index in self._page_plot_data:
+            if ch in self._page_plot_data[page_index]:
+                x_data, y_data = self._page_plot_data[page_index][ch]
+                x_data.append(now.timestamp())
+                y_data.append(temp)
         self.alarm_manager.check(ch, temp)
 
-        count = self.data_manager.record_count(ch)
-        self._update_status_bar_data_count(ch, count)
-
     def _update_all_curves(self):
-        """定时刷新所有通道的曲线"""
-        for ch in self._curves:
-            self._update_curve(ch)
+        page_index = self._current_page_index
+        if page_index in self._page_curves:
+            max_temp = float('-inf')
+            min_temp = float('inf')
 
-    def _update_curve(self, ch: int):
-        """
-        更新指定通道的曲线显示
+            for ch, curve in self._page_curves[page_index].items():
+                if ch in self._page_plot_data[page_index]:
+                    x_data, y_data = self._page_plot_data[page_index][ch]
+                    if x_data:
+                        if self._display_seconds > 0:
+                            cutoff = datetime.now().timestamp() - self._display_seconds
+                            while x_data and x_data[0] < cutoff:
+                                x_data.pop(0)
+                                y_data.pop(0)
+                        if x_data:
+                            base = x_data[0]
+                            rel_x = [x - base for x in x_data]
+                            curve.setData(rel_x, y_data)
+                            if y_data:
+                                max_temp = max(max_temp, max(y_data))
+                                min_temp = min(min_temp, min(y_data))
 
-        Args:
-            ch: 通道号
-        """
-        if ch not in self._plot_data or ch not in self._curves:
-            return
+            # 合并窗口模式：智能调整Y轴
+            if self._current_curve_mode == "merged":
+                if 0 in self._page_plots[page_index]:
+                    plot_widget = self._page_plots[page_index][0]
+                    y_range = plot_widget.viewRange()[1]
+                    y_min, y_max = y_range
 
-        x_data, y_data = self._plot_data[ch]
-        if not x_data:
-            return
+                    need_update = False
+                    new_y_min = y_min
+                    new_y_max = y_max
 
-        # 根据显示时长裁剪数据
-        if self._display_seconds > 0:
-            cutoff = datetime.now().timestamp() - self._display_seconds
-            while x_data and x_data[0] < cutoff:
-                x_data.pop(0)
-                y_data.pop(0)
+                    if max_temp > y_max:
+                        new_y_max = max_temp * 1.2
+                        need_update = True
 
-        if not x_data:
-            return
+                    if min_temp < y_min:
+                        new_y_min = min_temp * 1.2 if min_temp < 0 else 0
+                        need_update = True
 
-        # 计算相对时间（秒），避免 X 轴数值过大
-        base = x_data[0]
-        rel_x = [x - base for x in x_data]
-        self._curves[ch].setData(rel_x, y_data)
+                    if need_update:
+                        plot_widget.setYRange(new_y_min, new_y_max)
 
     # ==================== 连接状态 ====================
 
-    def _on_connection_changed(self, ch: int, connected: bool):
-        """
-        串口连接状态变化处理
-
-        Args:
-            ch: 通道号
-            connected: 是否已连接
-        """
-        if ch in self._status_labels:
-            if connected:
-                self._status_labels[ch].setText("[已连接]")
-                self._status_labels[ch].setStyleSheet("color: green;")
-            else:
-                self._status_labels[ch].setText("[断开]")
-                self._status_labels[ch].setStyleSheet("color: gray;")
+    def _on_connection_changed(self, connected: bool):
         self._update_status_bar()
 
-    def _on_serial_error(self, ch: int, error: str):
-        """
-        串口错误处理
-
-        Args:
-            ch: 通道号
-            error: 错误信息
-        """
-        QMessageBox.warning(self, f"CH{ch} 错误", error)
+    def _on_serial_error(self, error: str):
+        timestamp = datetime.now().strftime("%H:%M:%S.%f")[:-3]
+        self._log_text.appendHtml(
+            f'<span style="background-color: #FF0000; color: white;">[{timestamp}] 错误: {error}</span>'
+        )
+        self._log_text.verticalScrollBar().setValue(self._log_text.verticalScrollBar().maximum())
 
     # ==================== 报警处理 ====================
 
     def _on_alarm_triggered(self, ch: int, alarm_type: str, temp: float):
-        """
-        报警触发处理
-
-        Args:
-            ch: 通道号
-            alarm_type: "HIGH" 或 "LOW"
-            temp: 当前温度
-        """
-        # 温度标签变红
-        if ch in self._temp_labels:
-            self._temp_labels[ch].setStyleSheet("color: red; font-weight: bold;")
-        # 状态标签显示报警类型
-        if ch in self._status_labels:
-            type_text = "超上限" if alarm_type == "HIGH" else "低于下限"
-            self._status_labels[ch].setText(f"[报警: {type_text}]")
-            self._status_labels[ch].setStyleSheet("color: red;")
+        col = ch - 1
+        if self._temp_table and col < self._temp_table.columnCount():
+            item = self._temp_table.item(0, col)
+            if item:
+                item.setForeground(QColor("red"))
         self._update_status_bar()
 
     def _on_alarm_cleared(self, ch: int, alarm_type: str):
-        """
-        报警清除处理
-
-        Args:
-            ch: 通道号
-            alarm_type: "HIGH" 或 "LOW"
-        """
-        # 恢复温度标签样式
-        if ch in self._temp_labels:
-            self._temp_labels[ch].setStyleSheet("")
-        # 恢复状态标签
-        if ch in self._status_labels:
-            self._status_labels[ch].setText("[正常]")
-            self._status_labels[ch].setStyleSheet("color: green;")
+        col = ch - 1
+        if self._temp_table and col < self._temp_table.columnCount():
+            item = self._temp_table.item(0, col)
+            if item:
+                item.setForeground(QColor("black"))
         self._update_status_bar()
 
     # ==================== 状态栏 ====================
 
     def _update_status_bar(self):
-        """更新状态栏显示"""
+        port = self._port_combo.currentText()
+        channels = list(range(1, self._current_channel_count + 1))
         parts = []
-        mode = self._mode_combo.currentData()
-        channels = [1] if mode == "single" else [1, 2]
+        if self.serial_worker is not None and self.serial_worker.isRunning():
+            parts.append(f"{port} 已连接")
+        else:
+            parts.append(f"{port} 未连接")
         for ch in channels:
-            if ch in self.serial_workers and self.serial_workers[ch].isRunning():
-                port = self._combo_widgets["port"][ch].currentText()
-                parts.append(f"CH{ch}:{port} 已连接")
-            else:
-                parts.append(f"CH{ch} 未连接")
+            state = self.alarm_manager.get_state(ch)
+            parts.append(f"CH{ch}: {state}")
         self._status_bar.showMessage(" | ".join(parts))
-
-    def _update_status_bar_data_count(self, ch: int, count: int):
-        """更新状态栏数据量显示（可扩展）"""
-        pass
 
     # ==================== 采集设置 ====================
 
+    def _on_interval_changed(self, value: int):
+        """采集间隔变化"""
+        if self._update_timer.isActive():
+            self._update_timer.start(value)
+
     def _on_display_duration_changed(self, text: str):
-        """曲线显示时长变化"""
         self._display_seconds = DISPLAY_OPTIONS.get(text, 300)
 
     def _on_max_records_changed(self, value: int):
-        """最大记录数变化"""
         self.data_manager.max_records = value
-        # 调整现有 deque 的 maxlen
         for ch in self.data_manager._data:
             self.data_manager._data[ch] = deque(self.data_manager._data[ch], maxlen=value)
 
     # ==================== 数据导出 ====================
 
     def _export_csv(self):
-        """导出 CSV 文件"""
         channels = self._get_export_channels()
         if not channels:
             return
-        filepath, _ = QFileDialog.getSaveFileName(
-            self, "导出CSV", f"temperature_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
-            "CSV文件 (*.csv)"
-        )
+        filepath, _ = QFileDialog.getSaveFileName(self, "导出CSV", f"temperature_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv", "CSV文件 (*.csv)")
         if filepath:
             try:
                 self.data_manager.export_csv(filepath, channels)
@@ -950,14 +879,10 @@ class MainWindow(QMainWindow):
                 QMessageBox.warning(self, "导出失败", str(e))
 
     def _export_excel(self):
-        """导出 Excel 文件"""
         channels = self._get_export_channels()
         if not channels:
             return
-        filepath, _ = QFileDialog.getSaveFileName(
-            self, "导出Excel", f"temperature_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
-            "Excel文件 (*.xlsx)"
-        )
+        filepath, _ = QFileDialog.getSaveFileName(self, "导出Excel", f"temperature_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx", "Excel文件 (*.xlsx)")
         if filepath:
             try:
                 self.data_manager.export_excel(filepath, channels)
@@ -966,34 +891,15 @@ class MainWindow(QMainWindow):
                 QMessageBox.warning(self, "导出失败", str(e))
 
     def _get_export_channels(self) -> list[int]:
-        """
-        获取要导出的通道列表（双路模式下弹出选择对话框）
-
-        Returns:
-            通道号列表
-        """
-        mode = self._mode_combo.currentData()
-        # 单路模式直接返回 CH1
-        if mode == "single":
-            return [1]
-
-        # 双路模式：检查哪些通道有数据
-        channels = []
-        for ch in [1, 2]:
-            if self.data_manager.record_count(ch) > 0:
-                channels.append(ch)
-        if not channels:
+        channels = list(range(1, self._current_channel_count + 1))
+        has_data = [ch for ch in channels if self.data_manager.record_count(ch) > 0]
+        if not has_data:
             QMessageBox.information(self, "提示", "没有数据可导出")
             return []
-        # 只有一个通道有数据，直接返回
-        if len(channels) == 1:
-            return channels
-
-        # 两个通道都有数据，弹出选择对话框
-        items = [f"CH{ch} ({self.data_manager.record_count(ch)}条)" for ch in channels]
-        selected, ok = QInputDialog.getItem(
-            self, "选择导出通道", "导出通道:", items, 0, False
-        )
+        if len(has_data) == 1:
+            return has_data
+        items = [f"CH{ch} ({self.data_manager.record_count(ch)}条)" for ch in has_data]
+        selected, ok = QInputDialog.getItem(self, "选择导出通道", "导出通道:", items, 0, False)
         if ok and selected:
             ch = int(selected.split("CH")[1].split(" ")[0])
             return [ch]
@@ -1002,30 +908,36 @@ class MainWindow(QMainWindow):
     # ==================== 数据清空 ====================
 
     def _clear_data(self):
-        """清空所有数据（带确认对话框）"""
-        reply = QMessageBox.question(
-            self, "清空数据", "确定要清空所有数据吗？",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            QMessageBox.StandardButton.No,
-        )
+        reply = QMessageBox.question(self, "清空数据", "确定要清空所有数据吗？",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No, QMessageBox.StandardButton.No)
         if reply == QMessageBox.StandardButton.Yes:
+            # 1. 清空底层数据
             self.data_manager.clear()
-            # 清空曲线数据
-            for ch in self._plot_data:
-                self._plot_data[ch] = ([], [])
-            # 重置温度显示
-            for ch in self._temp_labels:
-                self._temp_labels[ch].setText(f"CH{ch}: -- °C")
-                self._temp_labels[ch].setStyleSheet("")
-            # 重置状态标签
-            for ch in self._status_labels:
-                self._status_labels[ch].setText("[正常]")
-                self._status_labels[ch].setStyleSheet("color: green;")
+            
+            # 2. 清空当前页面的画布数据并刷新曲线
+            page_index = self._current_page_index
+            if page_index in self._page_plot_data:
+                # 遍历当前页面的所有通道
+                for ch, (x_data, y_data) in self._page_plot_data[page_index].items():
+                    x_data.clear()  # 清空 x 轴缓存数据
+                    y_data.clear()  # 清空 y 轴缓存数据
+                    
+                    # 清空画布上对应的曲线
+                    if page_index in self._page_curves and ch in self._page_curves[page_index]:
+                        self._page_curves[page_index][ch].setData([], [])
+                        
+            # 3. 重置温度表格显示
+            if self._temp_table:
+                for col in range(self._temp_table.columnCount()):
+                    item = self._temp_table.item(0, col)
+                    if item:
+                        item.setText("-- °C")
+                        item.setForeground(QColor("black")) # 同时恢复字体颜色为黑色（取消报警红色）
+
 
     # ==================== 窗口事件 ====================
 
     def closeEvent(self, event):
-        """窗口关闭事件：停止采集、保存配置"""
-        self._stop_all()
+        self._stop_acquisition()
         self._save_config()
         event.accept()

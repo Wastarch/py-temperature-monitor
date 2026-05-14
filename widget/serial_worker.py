@@ -4,35 +4,96 @@
 功能：
 - 串口扫描（支持检测 Windows 注册表中的虚拟串口）
 - 串口数据读取（后台线程）
-- 解析下位机发送的温度数据（格式: TEMP:25.5\r\n）
+- 解析下位机发送的二进制温度数据帧
+- 支持配置数据处理间隔
+
+数据帧格式（可变长度）：
+┌──────┬────┬─────────────────────────┬──────┬──────┐
+│ 0xAA │ N  │ CH1 DATA ... CHn DATA   │ XOR  │ 0x0A │
+│ 起始  │ 通道数 │ N组通道数据(每组3字节) │ 校验 │ 结束 │
+└──────┴────┴─────────────────────────┴──────┴──────┘
+
+帧总长度 = N × 3 + 4 字节
+
+- 起始位：0xAA（固定）
+- 通道数 N：0x01~0x08
+- 每组通道数据：CH(1字节) + Data_H(1字节) + Data_L(1字节)
+- 校验：XOR = N ^ CH1 ^ Data_H1 ^ Data_L1 ^ ... ^ CHn ^ Data_Hn ^ Data_Ln
+- 结束符：0x0A（固定）
 """
 
 import sys
+import time
 
 import serial
 import serial.tools.list_ports
 from PySide6.QtCore import QThread, Signal
 
 
-def parse_temperature(data: bytes) -> float | None:
+# 帧常量
+FRAME_START = 0xAA
+FRAME_END = 0x0A
+FRAME_MIN_LENGTH = 6  # 最小帧长度（1通道：起始+通道数+3字节数据+校验+结束）
+
+
+def parse_binary_frame(data: bytes) -> list[tuple[int, float]] | None:
     """
-    解析温度数据
+    解析二进制温度数据帧
 
     Args:
-        data: 串口读取的原始字节数据
+        data: 帧数据（可变长度）
 
     Returns:
-        温度值（float），解析失败返回 None
+        [(通道号, 温度值), ...] 列表，解析失败返回 None
 
-    数据格式: "TEMP:25.5\r\n"
+    帧格式：[0xAA] [N] [CH1 Data_H Data_L ... CHn Data_H Data_L] [XOR] [0x0A]
     """
-    text = data.decode("ascii", errors="ignore").strip()
-    if text.startswith("TEMP:"):
-        try:
-            return float(text[5:])
-        except ValueError:
-            return None
-    return None
+    # 基本长度检查
+    if len(data) < FRAME_MIN_LENGTH:
+        return None
+
+    # 检查起始位和结束位
+    if data[0] != FRAME_START or data[-1] != FRAME_END:
+        return None
+
+    # 获取通道数
+    n = data[1]
+    if n < 1 or n > 8:
+        return None
+
+    # 检查帧长度
+    expected_len = n * 3 + 4
+    if len(data) != expected_len:
+        return None
+
+    # 提取数据区
+    channel_data = data[2:2 + n * 3]
+    xor_recv = data[2 + n * 3]
+
+    # 计算校验
+    xor_calc = n
+    for b in channel_data:
+        xor_calc ^= b
+
+    if xor_calc != xor_recv:
+        return None
+
+    # 解析各通道数据
+    result = []
+    for i in range(n):
+        ch = channel_data[i * 3]
+        data_h = channel_data[i * 3 + 1]
+        data_l = channel_data[i * 3 + 2]
+
+        # 解析温度（16位有符号整数，大端序）
+        raw_value = (data_h << 8) | data_l
+        if raw_value > 32767:
+            raw_value -= 65536
+        temp = raw_value / 10.0
+
+        result.append((ch, temp))
+
+    return result
 
 
 def list_available_ports() -> list[str]:
@@ -41,10 +102,6 @@ def list_available_ports() -> list[str]:
 
     Returns:
         串口设备名列表，按 COM 号排序
-
-    扫描方式：
-    1. pyserial 标准扫描（检测物理串口、USB 转串口等）
-    2. Windows 注册表扫描（检测虚拟串口软件创建的端口，如 com0com、ELTIMA 等）
     """
     # 方法1: pyserial 标准扫描
     ports = [p.device for p in serial.tools.list_ports.comports()]
@@ -71,7 +128,7 @@ def list_available_ports() -> list[str]:
         except Exception:
             pass
 
-    # 按 COM 号数字排序（COM1, COM2, COM10, COM11）
+    # 按 COM 号数字排序
     def port_sort_key(port: str):
         if port.startswith("COM"):
             try:
@@ -88,73 +145,130 @@ class SerialWorker(QThread):
     """
     串口通信工作线程
 
+    支持单串口多通道模式：从一个串口接收多个通道的二进制数据帧
+    支持配置数据处理间隔
+
     信号：
         temperature_received(channel_id, temp): 接收到温度数据
-        raw_data_received(channel_id, data): 接收到原始数据
-        connection_changed(channel_id, connected): 连接状态变化
-        error_occurred(channel_id, error_msg): 发生错误
+        raw_data_received(hex_str, result): 接收到原始数据和解析结果
+        connection_changed(connected): 连接状态变化
+        error_occurred(error_msg): 发生错误
     """
 
     temperature_received = Signal(int, float)
-    raw_data_received = Signal(int, str)  # (通道号, 原始数据)
-    connection_changed = Signal(int, bool)
-    error_occurred = Signal(int, str)
+    raw_data_received = Signal(str, list)
+    connection_changed = Signal(bool)
+    error_occurred = Signal(str)
 
-    def __init__(self, channel_id: int, port: str, baudrate: int = 9600):
+    def __init__(self, port: str, baudrate: int = 9600, interval_ms: int = 1000):
         """
         初始化串口工作线程
 
         Args:
-            channel_id: 通道号（1 或 2）
             port: 串口设备名（如 "COM10"）
             baudrate: 波特率
+            interval_ms: 数据处理间隔（毫秒）
         """
         super().__init__()
-        self.channel_id = channel_id
         self.port = port
         self.baudrate = baudrate
+        self.interval_ms = interval_ms
         self._running = False
 
     def run(self):
-        """线程主循环：打开串口，持续读取数据"""
+        """线程主循环：打开串口，持续读取并解析二进制帧"""
         self._running = True
 
         # 打开串口
         try:
             ser = serial.Serial(self.port, self.baudrate, timeout=1)
-            self.connection_changed.emit(self.channel_id, True)
+            self.connection_changed.emit(True)
         except Exception as e:
-            self.error_occurred.emit(self.channel_id, f"串口打开失败: {e}")
-            self.connection_changed.emit(self.channel_id, False)
+            self.error_occurred.emit(f"串口打开失败: {e}")
+            self.connection_changed.emit(False)
             return
 
         # 循环读取数据
         try:
+            buffer = bytearray()
+            last_process_time = time.time() * 1000
+
             while self._running:
-                line = ser.readline()
-                if not line:
+                # 读取可用数据
+                data = ser.read(ser.in_waiting or 1)
+                if not data:
                     continue
-                # 发送原始数据
-                try:
-                    raw_text = line.decode("ascii", errors="ignore").strip()
-                    if raw_text:
-                        self.raw_data_received.emit(self.channel_id, raw_text)
-                except Exception:
-                    pass
-                # 解析温度
-                temp = parse_temperature(line)
-                if temp is not None:
-                    self.temperature_received.emit(self.channel_id, temp)
+                buffer.extend(data)
+
+                # 检查是否到达处理间隔
+                current_time = time.time() * 1000
+                if current_time - last_process_time < self.interval_ms:
+                    continue
+
+                # 从缓冲区中查找帧
+                while len(buffer) >= FRAME_MIN_LENGTH:
+                    # 查找起始位 0xAA
+                    start_idx = buffer.find(FRAME_START)
+                    if start_idx < 0:
+                        buffer.clear()
+                        break
+
+                    # 移除起始位之前的数据
+                    if start_idx > 0:
+                        buffer = buffer[start_idx:]
+
+                    # 检查是否有足够的数据读取通道数
+                    if len(buffer) < 2:
+                        break
+
+                    # 获取通道数
+                    n = buffer[1]
+                    if n < 1 or n > 8:
+                        # 无效通道数，跳过这个起始位
+                        hex_str = " ".join(f"{b:02X}" for b in buffer[:min(len(buffer), 20)])
+                        self.error_occurred.emit(f"通道数错误: {n} (应为1-8) -> {hex_str}")
+                        buffer = buffer[1:]
+                        continue
+
+                    # 计算帧长度
+                    frame_len = n * 3 + 4
+
+                    # 检查是否有完整帧
+                    if len(buffer) < frame_len:
+                        break
+
+                    # 提取一帧数据
+                    frame = bytes(buffer[:frame_len])
+
+                    # 解析帧
+                    result = parse_binary_frame(frame)
+                    if result is not None:
+                        # 发送原始数据和解析结果
+                        hex_str = " ".join(f"{b:02X}" for b in frame)
+                        self.raw_data_received.emit(hex_str, result)
+
+                        # 发送各通道温度数据
+                        for ch, temp in result:
+                            self.temperature_received.emit(ch, temp)
+                    else:
+                        # 校验失败
+                        hex_str = " ".join(f"{b:02X}" for b in frame)
+                        self.error_occurred.emit(f"校验失败: {hex_str}")
+
+                    # 移除已处理的帧
+                    buffer = buffer[frame_len:]
+                    last_process_time = current_time
+
         except Exception as e:
             if self._running:
-                self.error_occurred.emit(self.channel_id, f"串口读取错误: {e}")
+                self.error_occurred.emit(f"串口读取错误: {e}")
         finally:
             # 关闭串口并通知连接断开
             try:
                 ser.close()
             except Exception:
                 pass
-            self.connection_changed.emit(self.channel_id, False)
+            self.connection_changed.emit(False)
 
     def stop(self):
         """安全停止线程"""
