@@ -55,8 +55,11 @@ from core.serial_worker import SerialWorker, list_available_ports
 CONFIG_FILE = os.path.join(os.path.dirname(os.path.dirname(__file__)), "config.json")
 
 # 常量
+# 波特率选项列表，用于串口通信设置
 BAUDRATES = ["4800", "9600", "19200", "38400", "57600", "115200"]
+# 显示选项字典，键为显示时间范围描述，值为对应的秒数
 DISPLAY_OPTIONS = {"1分钟": 60, "5分钟": 300, "10分钟": 600, "30分钟": 1800, "全部": 0}
+# 曲线颜色列表，用于图表显示，每个颜色后附有注释说明
 CURVE_COLORS = [
     "#00BFFF",  # 蓝色
     "#FF6347",  # 红色
@@ -67,8 +70,11 @@ CURVE_COLORS = [
     "#00CED1",  # 青色
     "#FF8C00",  # 橙色
 ]
+# 曲线显示模式字典，键为显示模式描述，值为对应的标识符
 CURVE_DISPLAY_MODES = {"合并窗口": "merged", "独立窗口": "separate"}
+# 曲线显示的最小高度值，单位为像素
 CURVE_MIN_HEIGHT = 200
+# 表格列宽设置，单位为像素
 TABLE_COL_WIDTH = 80
 
 
